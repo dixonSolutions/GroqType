@@ -1,78 +1,146 @@
 # GroqType
 
-System-wide speech-to-text for Linux. Hold a shortcut key, speak, and GroqType transcribes via Groq and pastes the result into whatever you're typing.
+<p align="center">
+  <strong>Hold a key. Speak. Text appears — in any app, anywhere on your desktop.</strong>
+</p>
 
-## Requirements
+<p align="center">
+  System-wide speech-to-text for Linux, powered by Groq Whisper.
+</p>
 
-- Linux with Wayland (or X11)
-- [keyd](https://github.com/rvaiya/keyd) — global hotkey remapping
-- [ydotool](https://github.com/ReimuNotMoe/ydotool) — keyboard simulation
-- `wl-clipboard` — Wayland clipboard (`wl-copy`)
-- Python 3.10+
-- A [Groq API key](https://console.groq.com/keys)
+---
+
+<video width="100%" controls>
+  <source src="docs/captures/groqtype-demo.webm" type="video/webm">
+  <a href="docs/captures/groqtype-demo.webm">Watch the demo</a>
+</video>
+
+---
+
+## Why GroqType?
+
+Most dictation tools live inside one app — a browser tab, a notes window, a proprietary desktop client. GroqType works at the **OS level**:
+
+| Problem with other tools | How GroqType solves it |
+|--------------------------|------------------------|
+| Tied to a single application | Types or pastes into **whatever has focus** |
+| Cloud tools need copy-paste gymnastics | Hold-to-talk → text lands directly in your editor |
+| Electron apps are heavy and closed | Small Python daemon + your existing Linux stack |
+| Per-app integrations don't scale | One global hotkey for your entire session |
+
+**Use cases:** coding in your IDE, writing emails, filling forms, taking notes in a terminal, chatting — anywhere you already type.
+
+---
 
 ## Quick start
+
+**Requirements:** Linux (Wayland or X11), Python 3.10+, [Groq API key](https://console.groq.com/keys)
 
 ```bash
 git clone https://github.com/dixonSolutions/GroqType.git
 cd GroqType
 
-# 1. Install system + Python dependencies
+# 1. System packages + Python venv
 ./scripts/install-deps.sh
 
-# 2. Full interactive setup (API key, shortcut, systemd)
+# 2. Interactive setup (API key, shortcut, systemd, CLI)
 ./scripts/install.sh
-
-# Or non-interactive:
-GROQ_API_KEY='your-key' ./scripts/install.sh --quick
 ```
+
+Non-interactive install:
+
+```bash
+GROQ_API_KEY='gsk_your_key' ./scripts/install.sh --quick
+```
+
+Hold **Caps Lock** (default), speak, release. Text appears in the focused window.
+
+Check it's running:
+
+```bash
+sudo systemctl status groqtype    # system service (default)
+./scripts/doctor.sh --check         # full health check
+```
+
+---
+
+## How it works (30 seconds)
+
+```
+Caps Lock  →  keyd  →  groqtype daemon  →  Groq Whisper  →  ydotool / clipboard  →  your app
+```
+
+1. **keyd** remaps your physical shortcut to a virtual hotkey.
+2. The **daemon** records audio while you hold the key.
+3. Audio goes to **Groq Whisper** for transcription.
+4. Text is **typed or pasted** into the focused window via `ydotool` and `wl-clipboard`.
+
+Deeper dive → [docs/architecture.md](docs/architecture.md)
+
+---
+
+## Configuration
+
+```bash
+./scripts/config.sh show                    # view settings (secrets masked)
+./scripts/config.sh set transcribe-mode stream   # live streaming mode
+./scripts/config.sh set api-key gsk_...     # update API key
+./scripts/config.sh restart                 # restart service
+```
+
+Or via CLI:
+
+```bash
+groqtype config-show
+groqtype shortcut set capslock
+groqtype config transcribe-mode stream
+```
+
+Full reference → [docs/configuration.md](docs/configuration.md)
+
+---
 
 ## Scripts
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/install-deps.sh` | Install system packages and Python venv |
-| `scripts/install.sh` | Full setup: config, keyd shortcut, systemd, CLI |
-| `scripts/doctor.sh` | Diagnose and repair configuration |
+| [`install-deps.sh`](scripts/install-deps.sh) | Install OS packages and Python venv |
+| [`install.sh`](scripts/install.sh) | Full interactive setup |
+| [`config.sh`](scripts/config.sh) | Manage settings and secrets |
+| [`doctor.sh`](scripts/doctor.sh) | Diagnose and repair |
 
 ```bash
 ./scripts/doctor.sh --check   # report only
-./scripts/doctor.sh --fix     # auto-fix issues
+./scripts/doctor.sh --fix     # auto-fix common issues
 ```
 
-## Shortcut key
-
-Default shortcut is **Caps Lock**. Set it from the terminal:
-
-```bash
-groqtype shortcut set capslock      # default
-sudo groqtype shortcut set leftalt  # sudo required for keyd
-
-groqtype shortcut show
-groqtype shortcut list
-```
-
-Setting a shortcut wipes any existing keyd bindings for that key and replaces them with the GroqType mapping.
-
-## Configuration
-
-```bash
-groqtype config-show
-groqtype config api-key <key>
-groqtype config shortcut capslock
-```
-
-Config is stored at `~/.config/groqtype/config.json` (or `/etc/groqtype/config.json` for system service).
-
-## Service
-
-```bash
-systemctl --user status groqtype    # user service
-sudo systemctl status groqtype      # system service
-
-systemctl --user restart groqtype
-```
+---
 
 ## Supported distros
 
 Dependency install supports **apt** (Debian/Ubuntu), **dnf** (Fedora), **pacman** (Arch), and **zypper** (openSUSE).
+
+---
+
+## Documentation
+
+| Doc | Description |
+|-----|-------------|
+| [docs/](docs/) | Documentation index |
+| [Architecture](docs/architecture.md) | Layered system design |
+| [Configuration](docs/configuration.md) | Settings, secrets, services |
+| [Development](docs/development.md) | Code layout and contributor workflow |
+
+---
+
+## Contributing
+
+Contributions are welcome — including from first-time open-source contributors.
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for how to get started. A good first step is running `./scripts/doctor.sh --check` on your machine and reporting what you find.
+
+---
+
+## License
+
+See repository license file. If none is present yet, check with the maintainers before redistributing.

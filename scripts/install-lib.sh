@@ -25,6 +25,7 @@ SYSTEM_CONFIG="/etc/groqtype/config.json"
 REAL_USER="${USER:-}"
 REAL_HOME="${HOME:-}"
 USER_CONFIG=""
+USER_SYSTEMD_UNIT=""
 
 SYSTEM_PACKAGES=(python3 python3-venv python3-pip keyd ydotool wl-clipboard libportaudio2)
 
@@ -369,24 +370,286 @@ print("" if val is None else val)
 PY
 }
 
-read_shortcut_settings() {
-  local shortcut="capslock" hotkey="f18" config=""
+groqtype_services_running() {
+  local system_on=false user_on=false
+  systemctl is-active "${SERVICE_NAME}.service" >/dev/null 2>&1 && system_on=true
+  systemctl --user is-active "${SERVICE_NAME}.service" >/dev/null 2>&1 && user_on=true
+  printf '%s\n%s' "${system_on}" "${user_on}"
+}
+
+warn_duplicate_groqtype_services() {
+  local states system_on user_on
+  states="$(groqtype_services_running)"
+  system_on="${states%%$'\n'*}"
+  user_on="${states##*$'\n'}"
+  if [[ "${system_on}" == "true" && "${user_on}" == "true" ]]; then
+    log_warn "Both system and user groqtype services are running — this causes duplicate text"
+    log_warn "Stop one with: systemctl --user stop groqtype  OR  sudo systemctl stop groqtype"
+    return 1
+  fi
+  return 0
+}
+
+stop_duplicate_groqtype_service() {
+  local config_file="${1:-}"
+  local states system_on user_on
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  states="$(groqtype_services_running)"
+  system_on="${states%%$'\n'*}"
+  user_on="${states##*$'\n'}"
+  [[ "${system_on}" == "true" && "${user_on}" == "true" ]] || return 0
+
+  if [[ "${config_file}" == "${SYSTEM_CONFIG}" && -f "${SYSTEMD_UNIT}" ]]; then
+    log_info "Stopping duplicate user groqtype service (using system config)"
+    systemctl --user disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
+    return 0
+  fi
+  if [[ "${config_file}" == "${USER_CONFIG}" && -f "${USER_SYSTEMD_UNIT}" ]]; then
+    log_info "Stopping duplicate system groqtype service (using user config)"
+    run_sudo systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
+
+resolve_active_config() {
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
   if systemctl is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1 \
     && config_file_readable "${SYSTEM_CONFIG}"; then
-    config="${SYSTEM_CONFIG}"
-  elif systemctl --user is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1 \
-    && [[ -f "${USER_CONFIG}" ]]; then
-    config="${USER_CONFIG}"
-  elif config_file_readable "${SYSTEM_CONFIG}"; then
-    config="${SYSTEM_CONFIG}"
-  elif [[ -f "${USER_CONFIG}" ]]; then
-    config="${USER_CONFIG}"
+    echo "${SYSTEM_CONFIG}"
+    return 0
   fi
+  if systemctl --user is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1 \
+    && [[ -f "${USER_CONFIG}" ]]; then
+    echo "${USER_CONFIG}"
+    return 0
+  fi
+  if config_file_readable "${SYSTEM_CONFIG}"; then
+    echo "${SYSTEM_CONFIG}"
+    return 0
+  fi
+  if [[ -f "${USER_CONFIG}" ]]; then
+    echo "${USER_CONFIG}"
+    return 0
+  fi
+  echo "${USER_CONFIG}"
+}
+
+read_shortcut_settings() {
+  local shortcut="capslock" hotkey="f18" config=""
+  config="$(resolve_active_config)"
   if [[ -n "${config}" ]]; then
     shortcut="$(read_config_value "${config}" "shortcut_key" 2>/dev/null || echo "capslock")"
     hotkey="$(read_config_value "${config}" "hotkey" 2>/dev/null || echo "f18")"
   fi
   printf '%s\n%s' "${shortcut}" "${hotkey}"
+}
+
+mask_secret_value() {
+  local key="$1"
+  local value="$2"
+  case "${key}" in
+    api_key|api-key)
+      if [[ -z "${value}" ]]; then
+        echo "(not set)"
+      elif [[ "${#value}" -le 8 ]]; then
+        echo "***"
+      else
+        echo "${value:0:8}..."
+      fi
+      ;;
+    *)
+      if [[ -z "${value}" ]]; then
+        echo "(not set)"
+      else
+        echo "${value}"
+      fi
+      ;;
+  esac
+}
+
+normalize_config_key() {
+  local key="${1,,}"
+  key="${key//-/_}"
+  case "${key}" in
+    api_key|provider|streaming_model|batch_model|language|transcribe_mode|output_mode|paste_command|paste_delay_ms|sample_rate|hotkey|shortcut_key|stream_window_sec|stream_step_sec|ydotool_socket) echo "${key}" ;;
+    *) echo "${key}" ;;
+  esac
+}
+
+_config_python_read() {
+  local file="$1"
+  "${VENV_PYTHON}" - "${file}" <<'PY'
+import json, os, subprocess, sys
+path = sys.argv[1]
+if os.path.exists(path) and os.access(path, os.R_OK):
+    data = json.load(open(path))
+else:
+    for cmd in (["sudo", "-n", "cat", path], ["sudo", "cat", path]):
+        try:
+            raw = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+            break
+        except Exception:
+            raw = None
+    if not raw:
+        raise SystemExit(1)
+    data = json.loads(raw)
+print(json.dumps(data))
+PY
+}
+
+_config_python_write() {
+  local file="$1"
+  local json_payload="$2"
+  local payload_tmp target_tmp
+  payload_tmp="$(mktemp)"
+  printf '%s' "${json_payload}" > "${payload_tmp}"
+  if [[ "${file}" == "${SYSTEM_CONFIG}" ]] && ! is_root && [[ ! -w "${file}" ]]; then
+    target_tmp="$(mktemp)"
+    "${VENV_PYTHON}" - "${target_tmp}" "${payload_tmp}" <<'PY'
+import json, os, sys
+out_path, src = sys.argv[1], sys.argv[2]
+with open(src) as f:
+    data = json.load(f)
+with open(out_path, "w") as f:
+    json.dump(data, f, indent=2)
+os.chmod(out_path, 0o600)
+PY
+    run_sudo mkdir -p /etc/groqtype
+    run_sudo cp "${target_tmp}" "${file}"
+    run_sudo chown "${REAL_USER}:${REAL_USER}" "${file}"
+    run_sudo chmod 600 "${file}"
+    rm -f "${target_tmp}" "${payload_tmp}"
+    return 0
+  fi
+  "${VENV_PYTHON}" - "${file}" "${payload_tmp}" <<'PY'
+import json, os, sys
+path, src = sys.argv[1], sys.argv[2]
+with open(src) as f:
+    data = json.load(f)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+os.chmod(path, 0o600)
+PY
+  rm -f "${payload_tmp}"
+}
+
+update_config_value() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  key="$(normalize_config_key "${key}")"
+  local payload
+  payload="$("${VENV_PYTHON}" - "${file}" "${key}" "${value}" <<'PY'
+import json, os, subprocess, sys
+path, key, raw = sys.argv[1], sys.argv[2], sys.argv[3]
+if os.path.exists(path) and os.access(path, os.R_OK):
+    data = json.load(open(path))
+elif os.path.exists(path):
+    for cmd in (["sudo", "-n", "cat", path], ["sudo", "cat", path]):
+        try:
+            raw_json = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+            break
+        except Exception:
+            raw_json = None
+    if not raw_json:
+        data = {}
+    else:
+        data = json.loads(raw_json)
+else:
+    data = {}
+def parse_value(value):
+    if value.lower() == "null":
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+data[key] = parse_value(raw)
+print(json.dumps(data))
+PY
+)" || return 1
+  _config_python_write "${file}" "${payload}"
+}
+
+unset_config_value() {
+  local file="$1"
+  local key="$2"
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  key="$(normalize_config_key "${key}")"
+  local payload
+  payload="$("${VENV_PYTHON}" - "${file}" "${key}" <<'PY'
+import json, os, subprocess, sys
+path, key = sys.argv[1], sys.argv[2]
+defaults = {
+    "api_key": "",
+    "provider": "groq",
+    "streaming_model": "whisper-large-v3-turbo",
+    "batch_model": "whisper-large-v3-turbo",
+    "language": "en",
+    "transcribe_mode": "batch",
+    "output_mode": "paste",
+    "paste_command": ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+    "paste_delay_ms": 80,
+    "sample_rate": 16000,
+    "hotkey": "f18",
+    "shortcut_key": "capslock",
+    "stream_window_sec": 6.0,
+    "stream_step_sec": 0.7,
+    "ydotool_socket": None,
+}
+if os.path.exists(path) and os.access(path, os.R_OK):
+    data = json.load(open(path))
+elif os.path.exists(path):
+    for cmd in (["sudo", "-n", "cat", path], ["sudo", "cat", path]):
+        try:
+            raw_json = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+            break
+        except Exception:
+            raw_json = None
+    if not raw_json:
+        data = {}
+    else:
+        data = json.loads(raw_json)
+else:
+    data = {}
+if key in defaults:
+    data[key] = defaults[key]
+elif key in data:
+    del data[key]
+print(json.dumps(data))
+PY
+)" || return 1
+  _config_python_write "${file}" "${payload}"
+}
+
+ensure_config_file() {
+  local file="$1"
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  if [[ -f "${file}" ]] && config_file_readable "${file}"; then
+    return 0
+  fi
+  local tmp payload
+  tmp="$(mktemp)"
+  default_config_json > "${tmp}"
+  payload="$(cat "${tmp}")"
+  rm -f "${tmp}"
+  _config_python_write "${file}" "${payload}"
+}
+
+sync_service_api_key() {
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  if systemctl is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+    install_systemd_service "system"
+    return 0
+  fi
+  if systemctl --user is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+    install_systemd_service "user"
+    return 0
+  fi
+  return 1
 }
 
 describe_shortcut_key() {
@@ -880,6 +1143,8 @@ restart_groqtype_service() {
       log_ok "Restarted ${SERVICE_NAME}.service (system)"
       return 0
     fi
+    log_warn "Could not restart system service (run: sudo systemctl restart ${SERVICE_NAME})"
+    return 1
   fi
 
   if _groqtype_user_service_installed; then
@@ -887,6 +1152,8 @@ restart_groqtype_service() {
       log_ok "Restarted ${SERVICE_NAME}.service (user)"
       return 0
     fi
+    log_warn "Could not restart user service (run: systemctl --user restart ${SERVICE_NAME})"
+    return 1
   fi
 
   return 0
