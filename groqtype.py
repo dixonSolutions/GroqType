@@ -117,6 +117,7 @@ class GroqTypeDaemon:
         self.stop_event = threading.Event()
         self.transcribe_thread = None
         self.output_lock = threading.Lock()
+        self.stream_transcribe_lock = threading.Lock()
 
     def _ensure_audio(self):
         global sd, sf, np
@@ -132,6 +133,13 @@ class GroqTypeDaemon:
              with self.frames_lock:
                 self.frames.append(indata.copy())
 
+    def reload_config(self):
+        self.cfg = load_config()
+        self.provider = get_provider(
+            self.cfg["provider"],
+            self.cfg.get("api_key") or os.environ.get("GROQ_API_KEY"),
+        )
+
     def start_recording(self):
         if self.is_recording:
             return "already recording"
@@ -140,6 +148,8 @@ class GroqTypeDaemon:
             self._ensure_audio()
         except Exception as exc:
             return f"error: audio init failed: {exc}"
+
+        self.reload_config()
 
         with self.frames_lock:
             self.frames.clear()
@@ -300,10 +310,16 @@ class GroqTypeDaemon:
             threading.Thread(target=self.async_transcribe, args=(process_audio,)).start()
 
     def async_transcribe(self, audio_data):
-        text = self.provider.transcribe_stream(audio_data, self.cfg["streaming_model"], self.cfg["language"]).strip()
-        
-        if text and not text.startswith("error:"):
-            self.sync_ui_text(text)
+        if not self.stream_transcribe_lock.acquire(blocking=False):
+            return
+        try:
+            text = self.provider.transcribe_stream(
+                audio_data, self.cfg["streaming_model"], self.cfg["language"]
+            ).strip()
+            if text and not text.startswith("error:"):
+                self.sync_ui_text(text)
+        finally:
+            self.stream_transcribe_lock.release()
 
     def copy_text(self, text):
         subprocess.run(["wl-copy"], input=text.encode(), check=True)
