@@ -30,7 +30,7 @@ DEFAULT_CONFIG = {
     "paste_command": ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
     "paste_delay_ms": 80,
     "sample_rate": 16000,
-    "hotkey": "f24",
+    "hotkey": "f13",
     "stream_window_sec": 6.0,
     "stream_step_sec": 0.7,
     "ydotool_socket": None,
@@ -280,7 +280,7 @@ class GroqTypeDaemon:
             return f"error: paste failed: {e}"
 
     def monitor(self):
-        hotkey = self.cfg.get("hotkey", "f24")
+        hotkey = self.cfg.get("hotkey", "f13")
         recording = False
         print(f"Monitoring hotkey: {hotkey}", flush=True)
         proc = subprocess.Popen(["keyd", "monitor"], stdout=subprocess.PIPE, text=True)
