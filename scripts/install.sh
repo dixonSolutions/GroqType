@@ -10,9 +10,9 @@ usage() {
 GroqType installer — interactive setup for dependencies, config, and systemd.
 
 Usage:
-  ./install.sh              Full interactive install
-  ./install.sh --quick      Non-interactive defaults (needs GROQ_API_KEY)
-  ./install.sh --help
+  ./scripts/install.sh              Full interactive install
+  ./scripts/install.sh --quick      Non-interactive defaults (needs GROQ_API_KEY)
+  ./scripts/install.sh --help
 
 Environment:
   GROQ_API_KEY              Groq API key (skips prompt when set)
@@ -43,12 +43,14 @@ run_quick_install() {
   local config_target="${SYSTEM_CONFIG}"
   [[ "${mode}" == "user" ]] && config_target="${REAL_HOME}/.config/groqtype/config.json"
 
-  write_config "${config_target}" "${api_key}" "groq" "f13" "batch" "paste" "en" \
+  write_config "${config_target}" "${api_key}" "groq" "capslock" "batch" "paste" "en" \
     "whisper-large-v3-turbo" "whisper-large-v3-turbo" "${socket}"
+  configure_keyd_shortcut "capslock" "f18" \
+    || log_warn "keyd shortcut not applied; run: sudo ./scripts/doctor.sh --fix"
 
   install_cli_symlink
   install_systemd_service "${mode}"
-  log_ok "Quick install complete. Run ./doctor.sh to verify."
+  log_ok "Quick install complete. Run ./scripts/doctor.sh to verify."
 }
 
 interactive_install() {
@@ -56,29 +58,22 @@ interactive_install() {
   banner
   log_info "Installing for user: ${REAL_USER} (${REAL_HOME})"
 
-  log_step "System dependencies"
+  log_step "Dependencies"
   local missing
   missing="$(missing_system_packages)"
   if [[ -n "${missing}" ]]; then
     log_warn "Missing packages/tools: ${missing}"
-    if prompt_yes_no "Install system packages now?" "y"; then
-      install_system_packages
+    if prompt_yes_no "Install dependencies now? (runs scripts/install-deps.sh)" "y"; then
+      "${SCRIPT_DIR}/install-deps.sh"
     else
-      log_warn "Continuing without installing system packages"
+      log_warn "Continuing without installing dependencies"
+    fi
+  elif ! check_python_imports >/dev/null 2>&1; then
+    if prompt_yes_no "Install Python dependencies now?" "y"; then
+      "${SCRIPT_DIR}/install-deps.sh" --python
     fi
   else
-    log_ok "System packages look good"
-  fi
-
-  log_step "Python environment"
-  if ! have_cmd python3; then
-    die "python3 is required. Install it and re-run."
-  fi
-  ensure_venv
-  if check_python_imports >/dev/null 2>&1; then
-    log_ok "Python dependencies installed"
-  else
-    die "Python dependency check failed. Re-run after fixing pip errors."
+    log_ok "Dependencies look good"
   fi
 
   log_step "Supporting services"
@@ -97,7 +92,7 @@ interactive_install() {
   local config_target mode
   if [[ -n "${GROQTYPE_SERVICE_MODE:-}" ]]; then
     mode="${GROQTYPE_SERVICE_MODE}"
-  elif prompt_yes_no "Install as system-wide root service? (recommended for global hotkeys)" "y"; then
+  elif prompt_yes_no "Install as system-wide service? (starts at boot, runs as your user)" "y"; then
     mode="system"
   else
     mode="user"
@@ -116,14 +111,14 @@ interactive_install() {
     config_target="${REAL_HOME}/.config/groqtype/config.json"
   fi
 
-  local current_api="" current_provider="groq" current_hotkey="f13"
+  local current_api="" current_provider="groq" current_shortcut="capslock"
   local current_tmode="batch" current_omode="paste" current_lang="en"
   local current_batch="whisper-large-v3-turbo" current_stream="whisper-large-v3-turbo"
 
   if [[ -f "${config_target}" ]]; then
     current_api="$(read_config_value "${config_target}" "api_key" 2>/dev/null || true)"
     current_provider="$(read_config_value "${config_target}" "provider" 2>/dev/null || echo "groq")"
-    current_hotkey="$(read_config_value "${config_target}" "hotkey" 2>/dev/null || echo "f13")"
+    current_shortcut="$(read_config_value "${config_target}" "shortcut_key" 2>/dev/null || echo "capslock")"
     current_tmode="$(read_config_value "${config_target}" "transcribe_mode" 2>/dev/null || echo "batch")"
     current_omode="$(read_config_value "${config_target}" "output_mode" 2>/dev/null || echo "paste")"
     current_lang="$(read_config_value "${config_target}" "language" 2>/dev/null || echo "en")"
@@ -145,9 +140,9 @@ interactive_install() {
   fi
   [[ -n "${api_key}" ]] || die "API key is required"
 
-  local provider hotkey transcribe_mode output_mode language batch_model streaming_model
+  local provider shortcut_key transcribe_mode output_mode language batch_model streaming_model
   provider="$(prompt_value "Provider (groq/elevenlabs)" "${current_provider}")"
-  hotkey="$(prompt_value "Hotkey (keyd name, e.g. f13)" "${current_hotkey}")"
+  shortcut_key="$(prompt_value "Shortcut key (e.g. capslock, leftalt)" "${current_shortcut}")"
   transcribe_mode="$(prompt_value "Transcribe mode (batch/stream)" "${current_tmode}")"
   output_mode="$(prompt_value "Output mode (paste/type/copy)" "${current_omode}")"
   language="$(prompt_value "Language code" "${current_lang}")"
@@ -162,12 +157,13 @@ interactive_install() {
     log_ok "ydotool socket: ${socket}"
   fi
 
-  write_config "${config_target}" "${api_key}" "${provider}" "${hotkey}" \
+  write_config "${config_target}" "${api_key}" "${provider}" "${shortcut_key}" \
     "${transcribe_mode}" "${output_mode}" "${language}" \
     "${batch_model}" "${streaming_model}" "${socket}"
   log_ok "Config written to ${config_target}"
 
-  suggest_keyd_snippet "${hotkey}"
+  configure_keyd_shortcut "${shortcut_key}" "f18" "${current_shortcut}" \
+    || log_warn "keyd shortcut not applied; run: sudo ./scripts/doctor.sh --fix"
 
   log_step "CLI and service"
   install_cli_symlink
@@ -184,9 +180,10 @@ GroqType is installed.
 
 Useful commands:
   groqtype config-show          Show current config
-  groqtype config hotkey f13    Change hotkey
-  ./doctor.sh                   Diagnose and repair issues
-  ./doctor.sh --fix             Auto-fix common problems
+  groqtype shortcut set capslock  Set shortcut key (default: capslock)
+  groqtype shortcut list          List valid key names
+  ./scripts/doctor.sh           Diagnose and repair issues
+  ./scripts/doctor.sh --fix       Auto-fix common problems
 
 Service control ($([[ "${mode}" == "system" ]] && echo "system" || echo "user")):
 $([[ "${mode}" == "system" ]] && echo "  sudo systemctl status groqtype" || echo "  systemctl --user status groqtype")

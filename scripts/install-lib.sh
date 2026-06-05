@@ -6,7 +6,8 @@ if [[ -n "${GROQTYPE_LIB_LOADED:-}" ]]; then
 fi
 GROQTYPE_LIB_LOADED=1
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 VENV_DIR="${PROJECT_DIR}/.venv"
 if [[ -x "${VENV_DIR}/bin/python" ]]; then
   VENV_PYTHON="${VENV_DIR}/bin/python"
@@ -64,6 +65,15 @@ run_sudo() {
   fi
 }
 
+run_as_real_user() {
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  if is_root; then
+    run_sudo -u "${REAL_USER}" env "HOME=${REAL_HOME}" "USER=${REAL_USER}" "$@"
+  else
+    "$@"
+  fi
+}
+
 detect_real_user() {
   if is_root; then
     if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
@@ -71,7 +81,7 @@ detect_real_user() {
     elif [[ -n "${GROQTYPE_USER:-}" ]]; then
       REAL_USER="${GROQTYPE_USER}"
     else
-      log_err "Run as a normal user, or use: sudo GROQTYPE_USER=youruser ./install.sh"
+      log_err "Run as a normal user, or use: sudo GROQTYPE_USER=youruser ./scripts/install.sh"
       exit 1
     fi
   else
@@ -279,14 +289,15 @@ ensure_venv() {
   if [[ -f "${REQUIREMENTS}" ]]; then
     "${VENV_PYTHON}" -m pip install -r "${REQUIREMENTS}"
   else
-    "${VENV_PYTHON}" -m pip install sounddevice soundfile numpy torch silero-vad
+    "${VENV_PYTHON}" -m pip install evdev sounddevice soundfile numpy torch silero-vad
   fi
 }
 
 check_python_imports() {
-  "${VENV_PYTHON}" - <<'PY'
+  local core_ok=false heavy_ok=false
+  if run_as_real_user timeout 15 "${VENV_PYTHON}" - <<'PY'
 import importlib
-mods = ["sounddevice", "soundfile", "numpy", "torch", "silero_vad"]
+mods = ["evdev", "sounddevice", "soundfile", "numpy"]
 missing = []
 for m in mods:
     try:
@@ -297,6 +308,19 @@ if missing:
     raise SystemExit("missing: " + ", ".join(missing))
 print("ok")
 PY
+  then
+    core_ok=true
+  fi
+  if run_as_real_user timeout 20 "${VENV_PYTHON}" - <<'PY'
+import importlib
+for m in ("torch", "silero_vad"):
+    importlib.import_module(m)
+print("ok")
+PY
+  then
+    heavy_ok=true
+  fi
+  [[ "${core_ok}" == "true" && "${heavy_ok}" == "true" ]]
 }
 
 default_config_json() {
@@ -312,7 +336,8 @@ default_config_json() {
   "paste_command": ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
   "paste_delay_ms": 80,
   "sample_rate": 16000,
-  "hotkey": "f13",
+  "hotkey": "f18",
+  "shortcut_key": "capslock",
   "stream_window_sec": 6.0,
   "stream_step_sec": 0.7,
   "ydotool_socket": null
@@ -344,11 +369,38 @@ print("" if val is None else val)
 PY
 }
 
+read_shortcut_settings() {
+  local shortcut="capslock" hotkey="f18" config=""
+  if systemctl is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1 \
+    && config_file_readable "${SYSTEM_CONFIG}"; then
+    config="${SYSTEM_CONFIG}"
+  elif systemctl --user is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1 \
+    && [[ -f "${USER_CONFIG}" ]]; then
+    config="${USER_CONFIG}"
+  elif config_file_readable "${SYSTEM_CONFIG}"; then
+    config="${SYSTEM_CONFIG}"
+  elif [[ -f "${USER_CONFIG}" ]]; then
+    config="${USER_CONFIG}"
+  fi
+  if [[ -n "${config}" ]]; then
+    shortcut="$(read_config_value "${config}" "shortcut_key" 2>/dev/null || echo "capslock")"
+    hotkey="$(read_config_value "${config}" "hotkey" 2>/dev/null || echo "f18")"
+  fi
+  printf '%s\n%s' "${shortcut}" "${hotkey}"
+}
+
+describe_shortcut_key() {
+  local shortcut_key="$1"
+  PYTHONPATH="${PROJECT_DIR}" "${VENV_PYTHON}" -c \
+    "from keyd_shortcut import describe_shortcut_bindings; print(describe_shortcut_bindings('${shortcut_key}'))" \
+    2>/dev/null || echo "${shortcut_key}"
+}
+
 _write_config_to_path() {
   local target="$1"
   local api_key="$2"
   local provider="$3"
-  local hotkey="$4"
+  local shortcut_key="$4"
   local transcribe_mode="$5"
   local output_mode="$6"
   local language="$7"
@@ -357,11 +409,12 @@ _write_config_to_path() {
   local ydotool_socket="${10}"
 
   mkdir -p "$(dirname "${target}")"
-  "${VENV_PYTHON}" - "${target}" "${api_key}" "${provider}" "${hotkey}" \
+  "${VENV_PYTHON}" - "${target}" "${api_key}" "${provider}" "${shortcut_key}" \
     "${transcribe_mode}" "${output_mode}" "${language}" \
     "${batch_model}" "${streaming_model}" "${ydotool_socket}" <<'PY'
 import json, os, sys
-path, api_key, provider, hotkey, tmode, omode, lang, batch, stream, ysocket = sys.argv[1:11]
+path, api_key, provider, shortcut_key, tmode, omode, lang, batch, stream, ysocket = sys.argv[1:11]
+api_key = api_key.strip()
 cfg = {
     "api_key": api_key,
     "provider": provider,
@@ -373,7 +426,8 @@ cfg = {
     "paste_command": ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
     "paste_delay_ms": 80,
     "sample_rate": 16000,
-    "hotkey": hotkey,
+    "hotkey": "f18",
+    "shortcut_key": shortcut_key,
     "stream_window_sec": 6.0,
     "stream_step_sec": 0.7,
     "ydotool_socket": ysocket if ysocket else None,
@@ -382,6 +436,23 @@ with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
 os.chmod(path, 0o600)
 PY
+}
+
+ensure_system_config_permissions() {
+  [[ -f "${SYSTEM_CONFIG}" ]] || return 0
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  local owner=""
+  owner="$(stat -c '%U' "${SYSTEM_CONFIG}" 2>/dev/null || echo "")"
+  if [[ "${owner}" == "${REAL_USER}" ]]; then
+    return 0
+  fi
+  if ! run_sudo true 2>/dev/null; then
+    log_warn "System config owned by ${owner:-unknown}; run sudo ./scripts/doctor.sh --fix"
+    return 1
+  fi
+  run_sudo chown "${REAL_USER}:${REAL_USER}" "${SYSTEM_CONFIG}"
+  run_sudo chmod 600 "${SYSTEM_CONFIG}"
+  log_ok "System config ownership set to ${REAL_USER}"
 }
 
 write_config() {
@@ -393,6 +464,7 @@ write_config() {
     _write_config_to_path "${tmp}" "$@"
     sudo mkdir -p /etc/groqtype
     sudo cp "${tmp}" "${target}"
+    sudo chown "${REAL_USER}:${REAL_USER}" "${target}"
     sudo chmod 600 "${target}"
     rm -f "${tmp}"
   elif is_root && [[ "${target}" == "${USER_CONFIG}" ]]; then
@@ -405,6 +477,11 @@ write_config() {
     rm -f "${tmp}"
   else
     _write_config_to_path "${target}" "$@"
+    if [[ "${target}" == "${SYSTEM_CONFIG}" ]]; then
+      [[ -n "${REAL_USER:-}" ]] || detect_real_user
+      chown "${REAL_USER}:${REAL_USER}" "${target}" 2>/dev/null || run_sudo chown "${REAL_USER}:${REAL_USER}" "${target}"
+      chmod 600 "${target}" 2>/dev/null || run_sudo chmod 600 "${target}"
+    fi
   fi
 }
 
@@ -430,7 +507,7 @@ validate_config_file() {
   "${VENV_PYTHON}" - "${file}" <<'PY'
 import json, os, subprocess, sys
 path = sys.argv[1]
-required = ["provider", "batch_model", "streaming_model", "hotkey", "transcribe_mode", "output_mode"]
+required = ["provider", "batch_model", "streaming_model", "hotkey", "shortcut_key", "transcribe_mode", "output_mode"]
 if os.access(path, os.R_OK):
     data = json.load(open(path))
 else:
@@ -513,6 +590,33 @@ EOF
   log_ok "CLI available at ${wrapper}"
 }
 
+systemd_unit_needs_update() {
+  local mode="$1"
+  local unit_file="" want_exec=""
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  if [[ "${mode}" == "system" ]]; then
+    unit_file="${SYSTEMD_UNIT}"
+  else
+    unit_file="${USER_SYSTEMD_UNIT}"
+  fi
+  [[ -f "${unit_file}" ]] || return 0
+  want_exec="${VENV_PYTHON} ${GROQTYPE_SCRIPT} daemon"
+  if ! grep -qF "ExecStart=${want_exec}" "${unit_file}" 2>/dev/null; then
+    return 0
+  fi
+  if [[ "${mode}" == "system" ]] && ! grep -qF "User=${REAL_USER}" "${unit_file}" 2>/dev/null; then
+    return 0
+  fi
+  if ! grep -qF "Environment=GROQTYPE_CONFIG=${SYSTEM_CONFIG}" "${unit_file}" 2>/dev/null \
+    && [[ "${mode}" == "system" ]]; then
+    return 0
+  fi
+  if ! grep -qF "Environment=PYTHONPATH=${PROJECT_DIR}" "${unit_file}" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
 render_systemd_unit() {
   local mode="$1" # system or user
   local socket
@@ -537,8 +641,10 @@ render_systemd_unit() {
   [[ -z "${preserved_api_key}" ]] && preserved_api_key="$(find_existing_api_key 2>/dev/null || true)"
 
   if [[ "${mode}" == "system" ]]; then
-    env_block+="User=root
-Group=root
+    env_block+="User=${REAL_USER}
+Group=${REAL_USER}
+SupplementaryGroups=keyd input
+Environment=GROQTYPE_CONFIG=${SYSTEM_CONFIG}
 "
   fi
 
@@ -552,6 +658,10 @@ Group=root
 "
   [[ -n "${SESSION_XDG_RUNTIME}" ]] && env_block+="Environment=XDG_RUNTIME_DIR=${SESSION_XDG_RUNTIME}
 "
+  [[ -n "${SESSION_XDG_RUNTIME}" ]] && env_block+="Environment=PULSE_SERVER=unix:${SESSION_XDG_RUNTIME}/pulse/native
+"
+  [[ -n "${SESSION_XDG_RUNTIME}" ]] && env_block+="Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=${SESSION_XDG_RUNTIME}/bus
+"
   [[ -n "${socket}" ]] && env_block+="Environment=YDOTOOL_SOCKET=${socket}
 "
   env_block+="Environment=PATH=${REAL_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
@@ -560,7 +670,7 @@ Group=root
   cat <<EOF
 [Unit]
 Description=GroqType speech-to-text daemon
-After=network.target sound.target ydotool.service keyd.service
+After=network.target sound.target ydotool.service keyd.service graphical.target
 Wants=ydotool.service keyd.service
 
 [Service]
@@ -579,11 +689,24 @@ install_systemd_service() {
   local mode="$1"
   if [[ "${mode}" == "system" ]]; then
     log_info "Installing system-wide service at ${SYSTEMD_UNIT}"
+    if systemctl --user is-active "${SERVICE_NAME}.service" >/dev/null 2>&1 \
+      || systemctl --user is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+      log_info "Disabling user groqtype service (only one service should run)"
+      if is_root; then
+        sudo -u "${REAL_USER}" systemctl --user disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
+      else
+        systemctl --user disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
+      fi
+    fi
     render_systemd_unit "system" | sudo tee "${SYSTEMD_UNIT}" >/dev/null
     sudo systemctl daemon-reload
     sudo systemctl enable --now "${SERVICE_NAME}.service"
   else
     log_info "Installing user service at ${USER_SYSTEMD_UNIT}"
+    if systemctl is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+      log_info "Disabling system groqtype service (only one service should run)"
+      run_sudo systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
+    fi
     if is_root; then
       sudo -u "${REAL_USER}" mkdir -p "$(dirname "${USER_SYSTEMD_UNIT}")"
       render_systemd_unit "user" | sudo -u "${REAL_USER}" tee "${USER_SYSTEMD_UNIT}" >/dev/null
@@ -645,7 +768,8 @@ defaults = {
     "paste_command": ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
     "paste_delay_ms": 80,
     "sample_rate": 16000,
-    "hotkey": "f13",
+    "hotkey": "f18",
+    "shortcut_key": "capslock",
     "stream_window_sec": 6.0,
     "stream_step_sec": 0.7,
     "ydotool_socket": None,
@@ -682,7 +806,8 @@ defaults = {
     "paste_command": ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
     "paste_delay_ms": 80,
     "sample_rate": 16000,
-    "hotkey": "f13",
+    "hotkey": "f18",
+    "shortcut_key": "capslock",
     "stream_window_sec": 6.0,
     "stream_step_sec": 0.7,
     "ydotool_socket": None,
@@ -706,14 +831,238 @@ os.chmod(path, 0o600)
 PY
 }
 
-suggest_keyd_snippet() {
-  local hotkey="$1"
-  local conf="/etc/keyd/default.conf"
-  if [[ -f "${conf}" ]] && grep -q "${hotkey}" "${conf}" 2>/dev/null; then
-    log_ok "keyd config already references ${hotkey}"
+restart_keyd_service() {
+  if ! have_cmd systemctl; then
+    run_sudo keyd reload 2>/dev/null && log_ok "Reloaded keyd" || true
     return 0
   fi
-  log_info "Suggested keyd mapping (add to ${conf} under [main]):"
-  echo "  capslock = ${hotkey}"
-  echo "  # or: leftmeta = ${hotkey}"
+  if run_sudo systemctl restart keyd.service 2>/dev/null; then
+    log_ok "Restarted keyd.service"
+    return 0
+  fi
+  if run_sudo keyd reload 2>/dev/null; then
+    log_ok "Reloaded keyd"
+  else
+    log_warn "Could not restart keyd.service"
+    return 1
+  fi
+}
+
+_user_systemctl() {
+  local action="$1"
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  if is_root; then
+    run_sudo -u "${REAL_USER}" \
+      env "XDG_RUNTIME_DIR=/run/user/${REAL_UID}" \
+      "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${REAL_UID}/bus" \
+      systemctl --user "${action}" "${SERVICE_NAME}.service"
+  else
+    systemctl --user "${action}" "${SERVICE_NAME}.service"
+  fi
+}
+
+_groqtype_user_service_installed() {
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  if is_root; then
+    [[ -f "${USER_SYSTEMD_UNIT}" ]]
+  else
+    systemctl --user is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1 \
+      || [[ -f "${USER_SYSTEMD_UNIT}" ]]
+  fi
+}
+
+restart_groqtype_service() {
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+
+  if systemctl is-active "${SERVICE_NAME}.service" >/dev/null 2>&1 \
+    || systemctl is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+    if run_sudo systemctl restart "${SERVICE_NAME}.service" 2>/dev/null; then
+      log_ok "Restarted ${SERVICE_NAME}.service (system)"
+      return 0
+    fi
+  fi
+
+  if _groqtype_user_service_installed; then
+    if _user_systemctl restart 2>/dev/null; then
+      log_ok "Restarted ${SERVICE_NAME}.service (user)"
+      return 0
+    fi
+  fi
+
+  return 0
+}
+
+restart_keyd_and_groqtype() {
+  restart_keyd_service || true
+  restart_groqtype_service || true
+}
+
+_gnome_custom_shortcut_paths() {
+  have_cmd gsettings || return 0
+  gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings 2>/dev/null \
+    | tr -d "[]'" | tr ',' '\n' | sed '/^$/d'
+}
+
+_gnome_shortcut_issue() {
+  if declare -F record_issue >/dev/null 2>&1; then
+    record_issue "$1"
+  else
+    log_warn "$1"
+  fi
+}
+
+check_gnome_shortcut_conflicts() {
+  local path name binding command
+  for path in $(_gnome_custom_shortcut_paths); do
+    name="$(gsettings get "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${path}" name 2>/dev/null | tr -d "'")"
+    binding="$(gsettings get "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${path}" binding 2>/dev/null | tr -d "'")"
+    command="$(gsettings get "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${path}" command 2>/dev/null | tr -d "'")"
+    if [[ "${binding}" == "F20" || "${binding}" == "f20" || "${binding}" == "F13" || "${binding}" == "f13" ]] \
+      || [[ "${command}" == *groqtype* ]]; then
+      _gnome_shortcut_issue "GNOME shortcut '${name:-custom}' on ${binding} conflicts with keyd (command: ${command})"
+    fi
+  done
+}
+
+check_gnome_media_key_blocks() {
+  have_cmd gsettings || return 0
+  local val
+  val="$(run_as_real_user gsettings get org.gnome.settings-daemon.plugins.media-keys control-center-static 2>/dev/null || echo "")"
+  if [[ "${val}" == *XF86Tools* ]]; then
+    _gnome_shortcut_issue "GNOME maps XF86Tools to Settings (control-center-static); blocks GroqType shortcut"
+  fi
+}
+
+fix_gnome_media_key_blocks() {
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  have_cmd gsettings || return 0
+
+  local changed=0 key val keys=(
+    control-center-static
+    control-center
+  )
+  for key in "${keys[@]}"; do
+    val="$(run_as_real_user gsettings get org.gnome.settings-daemon.plugins.media-keys "${key}" 2>/dev/null || echo "")"
+    if [[ "${val}" == *XF86Tools* ]]; then
+      log_info "Disabling GNOME ${key} (was: ${val})"
+      run_as_real_user gsettings set org.gnome.settings-daemon.plugins.media-keys "${key}" "[]"
+      changed=$((changed + 1))
+    fi
+  done
+  if [[ "${changed}" -gt 0 ]]; then
+    log_ok "Blocked GNOME Settings shortcut on XF86Tools"
+  fi
+}
+
+migrate_internal_hotkey() {
+  local config_file hotkey
+  for config_file in "${SYSTEM_CONFIG}" "${USER_CONFIG}"; do
+    [[ -f "${config_file}" ]] || continue
+    hotkey="$(read_config_value "${config_file}" "hotkey" 2>/dev/null || true)"
+    [[ "${hotkey}" == "f13" ]] || continue
+    log_info "Migrating hotkey f13 -> f18 in ${config_file}"
+    if [[ -w "${config_file}" ]]; then
+      "${VENV_PYTHON}" - "${config_file}" <<'PY' 2>/dev/null || continue
+import json, sys
+path = sys.argv[1]
+with open(path) as f: data = json.load(f)
+data["hotkey"] = "f18"
+with open(path, "w") as f: json.dump(data, f, indent=2)
+PY
+    else
+      run_sudo "${VENV_PYTHON}" - "${config_file}" <<'PY' 2>/dev/null || continue
+import json, sys
+path = sys.argv[1]
+with open(path) as f: data = json.load(f)
+data["hotkey"] = "f18"
+with open(path, "w") as f: json.dump(data, f, indent=2)
+PY
+    fi
+  done
+}
+
+fix_gnome_shortcut_conflicts() {
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  have_cmd gsettings || return 0
+
+  local path name binding command kept=() removed=0
+  for path in $(_gnome_custom_shortcut_paths); do
+    name="$(gsettings get "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${path}" name 2>/dev/null | tr -d "'")"
+    binding="$(gsettings get "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${path}" binding 2>/dev/null | tr -d "'")"
+    command="$(gsettings get "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${path}" command 2>/dev/null | tr -d "'")"
+    if [[ "${binding}" == "F20" || "${binding}" == "f20" || "${binding}" == "F13" || "${binding}" == "f13" ]] \
+      || [[ "${command}" == *groqtype* ]]; then
+      removed=$((removed + 1))
+      log_info "Removing conflicting GNOME shortcut '${name:-custom}' (${binding})"
+      if is_root; then
+        run_as_real_user gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${path}" binding "''" 2>/dev/null || true
+        run_as_real_user gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${path}" command "''" 2>/dev/null || true
+      else
+        gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${path}" binding "''" 2>/dev/null || true
+        gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${path}" command "''" 2>/dev/null || true
+      fi
+    else
+      kept+=("${path}")
+    fi
+  done
+
+  if [[ "${removed}" -gt 0 ]]; then
+    local new_list="[]" joined="" p
+    if [[ "${#kept[@]}" -gt 0 ]]; then
+      for p in "${kept[@]}"; do
+        joined+="'${p}',"
+      done
+      joined="${joined%,}"
+      new_list="[${joined}]"
+    fi
+    if is_root; then
+      run_as_real_user gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "${new_list}" 2>/dev/null || true
+    else
+      gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "${new_list}" 2>/dev/null || true
+    fi
+    log_ok "Removed ${removed} conflicting GNOME shortcut(s); use groqtype.service for hotkeys"
+    return 0
+  fi
+  return 1
+}
+
+configure_keyd_shortcut() {
+  local shortcut_key="${1:-capslock}"
+  local hotkey="${2:-f18}"
+  local old_shortcut="${3:-}"
+  local resolved
+  if ! have_cmd keyd; then
+    log_warn "keyd not found; shortcut not configured in keyd"
+    return 1
+  fi
+  if ! run_sudo true 2>/dev/null; then
+    log_warn "sudo required to configure keyd; run: sudo ./scripts/doctor.sh --fix"
+    return 1
+  fi
+  resolved="$(describe_shortcut_key "${shortcut_key}")"
+  log_info "Configuring keyd shortcut: ${resolved} -> ${hotkey}"
+  if [[ -n "${old_shortcut}" ]]; then
+    PYTHONPATH="${PROJECT_DIR}" "${VENV_PYTHON}" "${PROJECT_DIR}/keyd_shortcut.py" \
+      apply "${shortcut_key}" "${hotkey}" "${old_shortcut}"
+  else
+    PYTHONPATH="${PROJECT_DIR}" "${VENV_PYTHON}" "${PROJECT_DIR}/keyd_shortcut.py" \
+      apply "${shortcut_key}" "${hotkey}"
+  fi
+  local bind_args=()
+  local key
+  for key in f20 micmute prog1 prog2 capslock; do
+    bind_args+=("${key}=${hotkey}")
+  done
+  if ! run_sudo keyd bind "${bind_args[@]}" 2>/dev/null; then
+    log_warn "keyd live bind failed; relying on config file + service restart"
+  fi
+  if [[ -f /etc/keyd/keyd.conf ]] && [[ ! -s /etc/keyd/keyd.conf ]]; then
+    run_sudo rm -f /etc/keyd/keyd.conf 2>/dev/null || true
+  fi
+
+  fix_gnome_shortcut_conflicts || true
+  fix_gnome_media_key_blocks || true
+
+  log_info "Restarting keyd and groqtype services"
+  restart_keyd_and_groqtype
 }

@@ -15,6 +15,12 @@ from collections import deque
 from difflib import SequenceMatcher
 
 def get_config_path():
+    override = os.environ.get("GROQTYPE_CONFIG")
+    if override:
+        return Path(override)
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        return Path(f"/home/{sudo_user}") / ".config" / "groqtype" / "config.json"
     if os.geteuid() == 0:
         return Path("/etc/groqtype/config.json")
     return Path.home() / ".config" / "groqtype" / "config.json"
@@ -30,7 +36,8 @@ DEFAULT_CONFIG = {
     "paste_command": ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
     "paste_delay_ms": 80,
     "sample_rate": 16000,
-    "hotkey": "f13",
+    "hotkey": "f18",
+    "shortcut_key": "capslock",
     "stream_window_sec": 6.0,
     "stream_step_sec": 0.7,
     "ydotool_socket": None,
@@ -51,21 +58,43 @@ def ensure_dirs():
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 from providers.registry import get_provider
+from keyd_shortcut import (
+    DEFAULT_HOTKEY,
+    DEFAULT_SHORTCUT_KEY,
+    apply_shortcut,
+    current_binding_matches,
+    describe_shortcut_bindings,
+    list_valid_keys,
+    normalize_key,
+)
 
 def load_config():
+    global CONFIG_PATH
+    CONFIG_PATH = get_config_path()
     ensure_dirs()
     if not CONFIG_PATH.exists():
         save_config(DEFAULT_CONFIG)
-    with CONFIG_PATH.open("r") as f:
-        cfg = json.load(f)
+    try:
+        with CONFIG_PATH.open("r") as f:
+            cfg = json.load(f)
+    except PermissionError:
+        die(f"cannot read {CONFIG_PATH} (run: sudo ./scripts/doctor.sh --fix)")
     
-    # Migration
+    migrated = False
     if "model" in cfg and "provider" not in cfg:
         cfg["provider"] = "groq"
         cfg["streaming_model"] = cfg.pop("model")
         cfg["batch_model"] = cfg["streaming_model"]
+        migrated = True
+    if "shortcut_key" not in cfg:
+        cfg["shortcut_key"] = DEFAULT_SHORTCUT_KEY
+        migrated = True
+    if cfg.get("hotkey") == "f13":
+        cfg["hotkey"] = DEFAULT_HOTKEY
+        migrated = True
+    if migrated:
         save_config(cfg)
-        
+
     return {**DEFAULT_CONFIG, **cfg}
 
 def save_config(cfg):
@@ -76,24 +105,27 @@ def save_config(cfg):
 
 class GroqTypeDaemon:
     def __init__(self):
-        global sd, sf, np, torch, load_silero_vad, VADIterator
-        import sounddevice as sd
-        import soundfile as sf
-        import numpy as np
-        import torch
-        from silero_vad import load_silero_vad, VADIterator
-
         self.cfg = load_config()
         self.provider = get_provider(self.cfg["provider"], self.cfg.get("api_key") or os.environ.get("GROQ_API_KEY"))
         self.frames = deque()
         self.frames_lock = threading.Lock()
-        
+        self._audio_ready = False
+
         self.stream = None
         self.is_recording = False
         self.session_words = []
         self.stop_event = threading.Event()
         self.transcribe_thread = None
         self.output_lock = threading.Lock()
+
+    def _ensure_audio(self):
+        global sd, sf, np
+        if self._audio_ready:
+            return
+        import sounddevice as sd
+        import soundfile as sf
+        import numpy as np
+        self._audio_ready = True
         
     def audio_callback(self, indata, frames, time, status):
         if self.is_recording:
@@ -103,6 +135,11 @@ class GroqTypeDaemon:
     def start_recording(self):
         if self.is_recording:
             return "already recording"
+
+        try:
+            self._ensure_audio()
+        except Exception as exc:
+            return f"error: audio init failed: {exc}"
 
         with self.frames_lock:
             self.frames.clear()
@@ -280,25 +317,34 @@ class GroqTypeDaemon:
             return f"error: paste failed: {e}"
 
     def monitor(self):
-        hotkey = self.cfg.get("hotkey", "f13")
+        hotkey = self.cfg.get("hotkey", DEFAULT_HOTKEY)
+        shortcut_key = self.cfg.get("shortcut_key", DEFAULT_SHORTCUT_KEY)
         recording = False
-        print(f"Monitoring hotkey: {hotkey}", flush=True)
+        print(f"Monitoring shortcut: {describe_shortcut_bindings(shortcut_key)} -> {hotkey}", flush=True)
         proc = subprocess.Popen(["keyd", "monitor"], stdout=subprocess.PIPE, text=True)
+        hotkey_re = re.compile(rf"\b{re.escape(hotkey)}\b")
         for line in iter(proc.stdout.readline, ""):
             line = line.strip()
             if not line: continue
-            if hotkey in line:
-                if "down" in line and not recording:
-                    recording = True
-                    print(f"Hotkey {hotkey} DOWN -> {self.start_recording()}", flush=True)
-                elif "up" in line and recording:
-                    recording = False
-                    print(f"Hotkey {hotkey} UP -> {self.stop_recording()}", flush=True)
+            if not hotkey_re.search(line):
+                continue
+            if "down" in line and not recording:
+                recording = True
+                print(f"Hotkey {hotkey} DOWN -> {self.start_recording()}", flush=True)
+            elif "up" in line and recording:
+                recording = False
+                print(f"Hotkey {hotkey} UP -> {self.stop_recording()}", flush=True)
         proc.wait()
 
     def run(self):
         ensure_dirs()
         self.monitor()
+
+def set_shortcut_key(cfg: dict, shortcut_key: str) -> None:
+    old_shortcut = cfg.get("shortcut_key", DEFAULT_SHORTCUT_KEY)
+    hotkey = cfg.get("hotkey", DEFAULT_HOTKEY)
+    cfg["shortcut_key"] = normalize_key(shortcut_key)
+    apply_shortcut(cfg["shortcut_key"], hotkey, old_shortcut_key=old_shortcut)
 
 def cmd_config(args):
     cfg = load_config()
@@ -308,7 +354,10 @@ def cmd_config(args):
     elif args.key == "batch-model": cfg["batch_model"] = args.value
     elif args.key == "language": cfg["language"] = args.value
     elif args.key == "paste-delay-ms": cfg["paste_delay_ms"] = int(args.value)
-    elif args.key == "hotkey": cfg["hotkey"] = args.value
+    elif args.key == "shortcut": set_shortcut_key(cfg, args.value)
+    elif args.key == "hotkey":
+        cfg["hotkey"] = normalize_key(args.value)
+        apply_shortcut(cfg.get("shortcut_key", DEFAULT_SHORTCUT_KEY), cfg["hotkey"])
     elif args.key == "transcribe-mode":
         if args.value not in ["batch", "stream"]: die("transcribe-mode must be: batch or stream")
         cfg["transcribe_mode"] = args.value
@@ -318,9 +367,30 @@ def cmd_config(args):
     elif args.key == "stream-window-sec": cfg["stream_window_sec"] = float(args.value)
     elif args.key == "stream-step-sec": cfg["stream_step_sec"] = float(args.value)
     elif args.key == "ydotool-socket": cfg["ydotool_socket"] = args.value
-    else: die("valid config keys: api-key, provider, streaming-model, batch-model, language, paste-delay-ms, hotkey, transcribe-mode, output-mode, stream-window-sec, stream-step-sec, ydotool-socket")
+    else: die("valid config keys: api-key, provider, streaming-model, batch-model, language, paste-delay-ms, shortcut, hotkey, transcribe-mode, output-mode, stream-window-sec, stream-step-sec, ydotool-socket")
     save_config(cfg)
-    print(f"set {args.key} in {CONFIG_PATH}")
+    if args.key != "shortcut":
+        print(f"set {args.key} in {CONFIG_PATH}")
+
+def cmd_shortcut(args):
+    cfg = load_config()
+    if args.action == "list":
+        for key in sorted(list_valid_keys()):
+            print(key)
+        return
+    if args.action == "show":
+        shortcut_key = cfg.get("shortcut_key", DEFAULT_SHORTCUT_KEY)
+        hotkey = cfg.get("hotkey", DEFAULT_HOTKEY)
+        print(f"shortcut: {describe_shortcut_bindings(shortcut_key)} -> {hotkey}")
+        print(f"config: {CONFIG_PATH}")
+        return
+    if args.action == "set":
+        if not args.key:
+            die("usage: groqtype shortcut set <key>  (e.g. capslock, leftalt)")
+        set_shortcut_key(cfg, args.key)
+        save_config(cfg)
+        return
+    die("usage: groqtype shortcut set <key> | show | list")
 
 def cmd_config_show(_args):
     cfg = load_config()
@@ -337,10 +407,17 @@ def main():
     c.add_argument("key")
     c.add_argument("value")
     sub.add_parser("config-show")
+    shortcut = sub.add_parser("shortcut", help="Configure the physical shortcut key (default: capslock)")
+    shortcut_sub = shortcut.add_subparsers(dest="action", required=True)
+    shortcut_set = shortcut_sub.add_parser("set", help="Set shortcut key and update keyd")
+    shortcut_set.add_argument("key", help="Physical key name (e.g. capslock, leftalt)")
+    shortcut_sub.add_parser("show", help="Show current shortcut mapping")
+    shortcut_sub.add_parser("list", help="List valid keyd key names")
     args = parser.parse_args()
     if args.cmd == "daemon": GroqTypeDaemon().run()
     elif args.cmd == "config": cmd_config(args)
     elif args.cmd == "config-show": cmd_config_show(args)
+    elif args.cmd == "shortcut": cmd_shortcut(args)
 
 if __name__ == "__main__":
     main()

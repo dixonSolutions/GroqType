@@ -14,10 +14,13 @@ usage() {
 GroqType doctor — diagnose and repair system-wide configuration.
 
 Usage:
-  ./doctor.sh            Interactive check with optional fixes
-  ./doctor.sh --fix      Attempt to auto-fix all detected issues
-  ./doctor.sh --check    Report only (no prompts, exit 1 if issues)
-  ./doctor.sh --help
+  ./scripts/doctor.sh            Interactive check with optional fixes
+  ./scripts/doctor.sh --fix      Attempt to auto-fix all detected issues
+  ./scripts/doctor.sh --check    Report only (no prompts, exit 1 if issues)
+  ./scripts/doctor.sh --help
+
+Use sudo for keyd shortcut fixes (writes /etc/keyd/):
+  sudo ./scripts/doctor.sh --fix
 
 EOF
 }
@@ -134,7 +137,7 @@ check_audio() {
     record_issue "Cannot check audio: venv python missing"
     return 1
   fi
-  if "${VENV_PYTHON}" - <<'PY' >/dev/null 2>&1
+  if run_as_real_user timeout 8 "${VENV_PYTHON}" - <<'PY' >/dev/null 2>&1
 import sounddevice as sd
 devs = sd.query_devices()
 assert any(d.get('max_input_channels', 0) > 0 for d in devs)
@@ -188,7 +191,12 @@ fix_venv() {
   if [[ ! -x "${VENV_PYTHON}" ]] || ! check_python_imports >/dev/null 2>&1; then
     log_step "Fix: Python virtual environment"
     if [[ "${FIX_MODE}" == "true" ]] || prompt_yes_no "Recreate/repair Python venv?" "y"; then
-      ensure_venv
+      if is_root; then
+        run_as_real_user "${VENV_DIR}/bin/pip" install -r "${REQUIREMENTS}" 2>/dev/null \
+          || ensure_venv
+      else
+        ensure_venv
+      fi
       record_fix "Python venv repaired"
     fi
   fi
@@ -238,16 +246,17 @@ cfg = {
     "streaming_model": "whisper-large-v3-turbo", "batch_model": "whisper-large-v3-turbo",
     "language": "en", "transcribe_mode": "batch", "output_mode": "paste",
     "paste_command": ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
-    "paste_delay_ms": 80, "sample_rate": 16000, "hotkey": "f13",
+    "paste_delay_ms": 80, "sample_rate": 16000, "hotkey": "f18", "shortcut_key": "capslock",
     "stream_window_sec": 6.0, "stream_step_sec": 0.7,
     "ydotool_socket": socket if socket else None,
 }
 with open(path, "w") as f: json.dump(cfg, f, indent=2)
 os.chmod(path, 0o600)
 PY
+        ensure_system_config_permissions || true
       else
         mkdir -p "$(dirname "${file}")"
-        write_config "${file}" "${api}" "groq" "f13" "batch" "paste" "en" \
+        write_config "${file}" "${api}" "groq" "capslock" "batch" "paste" "en" \
           "whisper-large-v3-turbo" "whisper-large-v3-turbo" "${socket}"
       fi
       record_fix "Created ${label}"
@@ -293,12 +302,23 @@ PY
     fi
   fi
 
+  if [[ "${file}" == "${SYSTEM_CONFIG}" ]]; then
+    local owner=""
+    owner="$(stat -c '%U' "${file}" 2>/dev/null || echo "")"
+    if [[ "${owner}" != "${REAL_USER}" ]]; then
+      log_step "Fix: system config ownership for ${REAL_USER}"
+      if [[ "${FIX_MODE}" == "true" ]] || prompt_yes_no "Set ${file} owner to ${REAL_USER}?" "y"; then
+        ensure_system_config_permissions && record_fix "Fixed system config ownership"
+      fi
+    fi
+  fi
+
   local perms
   perms="$(stat -c '%a' "${file}" 2>/dev/null || echo "")"
   if [[ "${perms}" != "600" ]]; then
     if [[ "${FIX_MODE}" == "true" ]] || prompt_yes_no "Fix permissions on ${file}?" "y"; then
       if [[ "${file}" == "${SYSTEM_CONFIG}" ]]; then
-        sudo chmod 600 "${file}"
+        run_sudo chmod 600 "${file}"
       else
         chmod 600 "${file}"
       fi
@@ -343,6 +363,41 @@ PY
   done
 }
 
+check_duplicate_services() {
+  local system_on=false user_on=false
+  systemctl is-active "${SERVICE_NAME}.service" >/dev/null 2>&1 && system_on=true
+  systemctl --user is-active "${SERVICE_NAME}.service" >/dev/null 2>&1 && user_on=true
+  if [[ "${system_on}" == "true" && "${user_on}" == "true" ]]; then
+    record_issue "Both system and user groqtype services are running (causes duplicate hotkey handling)"
+    return 1
+  fi
+  if [[ "${system_on}" == "true" ]]; then
+    log_ok "groqtype system service is active"
+  elif [[ "${user_on}" == "true" ]]; then
+    log_ok "groqtype user service is active"
+  fi
+  return 0
+}
+
+fix_duplicate_services() {
+  local system_on=false user_on=false
+  systemctl is-active "${SERVICE_NAME}.service" >/dev/null 2>&1 && system_on=true
+  systemctl --user is-active "${SERVICE_NAME}.service" >/dev/null 2>&1 && user_on=true
+  [[ "${system_on}" == "true" && "${user_on}" == "true" ]] || return 0
+  log_step "Fix: stop duplicate groqtype service"
+  if [[ -f "${SYSTEMD_UNIT}" ]]; then
+    if [[ "${FIX_MODE}" == "true" ]] || prompt_yes_no "Disable user groqtype service (keep system service)?" "y"; then
+      systemctl --user disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
+      record_fix "Disabled duplicate user groqtype service"
+    fi
+  elif [[ -f "${USER_SYSTEMD_UNIT}" ]]; then
+    if [[ "${FIX_MODE}" == "true" ]] || prompt_yes_no "Disable system groqtype service (keep user service)?" "y"; then
+      run_sudo systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
+      record_fix "Disabled duplicate system groqtype service"
+    fi
+  fi
+}
+
 fix_systemd_service() {
   local mode=""
   if [[ -f "${SYSTEMD_UNIT}" ]]; then
@@ -361,10 +416,58 @@ fix_systemd_service() {
     return
   fi
 
+  if ! systemd_unit_needs_update "${mode}"; then
+    return 0
+  fi
   log_step "Fix: systemd unit paths and session environment"
   if [[ "${FIX_MODE}" == "true" ]] || prompt_yes_no "Regenerate ${mode} systemd unit with current paths?" "y"; then
     install_systemd_service "${mode}"
     record_fix "Regenerated ${mode} systemd unit"
+  fi
+}
+
+check_keyd_shortcut() {
+  local shortcut hotkey resolved check_status
+  mapfile -t _shortcut_cfg < <(read_shortcut_settings)
+  shortcut="${_shortcut_cfg[0]:-capslock}"
+  hotkey="${_shortcut_cfg[1]:-f18}"
+  resolved="$(PYTHONPATH="${PROJECT_DIR}" "${VENV_PYTHON}" - "${shortcut}" "${hotkey}" <<'PY'
+import sys
+from keyd_shortcut import current_binding_matches, describe_shortcut_bindings
+shortcut, hotkey = sys.argv[1], sys.argv[2]
+print(describe_shortcut_bindings(shortcut))
+raise SystemExit(0 if current_binding_matches(shortcut, hotkey) else 1)
+PY
+)"
+  check_status=$?
+  if [[ "${check_status}" -eq 0 ]]; then
+    log_ok "keyd shortcut configured (${resolved} -> ${hotkey})"
+    return 0
+  fi
+  record_issue "keyd shortcut not configured for ${resolved} -> ${hotkey} (run: sudo ./scripts/doctor.sh --fix)"
+  return 1
+}
+
+fix_keyd_shortcut() {
+  local shortcut hotkey resolved
+  mapfile -t _shortcut_cfg < <(read_shortcut_settings)
+  shortcut="${_shortcut_cfg[0]:-capslock}"
+  hotkey="${_shortcut_cfg[1]:-f18}"
+  resolved="$(describe_shortcut_key "${shortcut}")"
+  if [[ "${FIX_MODE}" != "true" ]] \
+    && PYTHONPATH="${PROJECT_DIR}" "${VENV_PYTHON}" - "${shortcut}" "${hotkey}" <<'PY' 2>/dev/null
+import sys
+from keyd_shortcut import current_binding_matches
+shortcut, hotkey = sys.argv[1], sys.argv[2]
+raise SystemExit(0 if current_binding_matches(shortcut, hotkey) else 1)
+PY
+  then
+    return 0
+  fi
+  log_step "Fix: keyd shortcut mapping (${resolved} -> ${hotkey})"
+  if [[ "${FIX_MODE}" == "true" ]] || prompt_yes_no "Apply keyd shortcut ${resolved} -> ${hotkey}?" "y"; then
+    configure_keyd_shortcut "${shortcut}" "${hotkey}" || return 1
+    record_fix "Configured keyd shortcut ${resolved} -> ${hotkey}"
   fi
 }
 
@@ -395,12 +498,10 @@ run_checks() {
   log_step "Services"
   check_service keyd.service system
   check_service ydotool.service system
-  if [[ -f "${SYSTEMD_UNIT}" ]]; then
-    check_service "${SERVICE_NAME}.service" system
-    check_systemd_unit_paths "${SYSTEMD_UNIT}"
-  elif [[ -f "${USER_SYSTEMD_UNIT}" ]]; then
-    check_service "${SERVICE_NAME}.service" user
-    check_systemd_unit_paths "${USER_SYSTEMD_UNIT}"
+  if [[ -f "${SYSTEMD_UNIT}" ]] || [[ -f "${USER_SYSTEMD_UNIT}" ]]; then
+    check_duplicate_services || true
+    [[ -f "${SYSTEMD_UNIT}" ]] && check_systemd_unit_paths "${SYSTEMD_UNIT}"
+    [[ -f "${USER_SYSTEMD_UNIT}" ]] && check_systemd_unit_paths "${USER_SYSTEMD_UNIT}"
   else
     record_issue "groqtype systemd unit not installed"
   fi
@@ -416,10 +517,15 @@ run_checks() {
   local has_system=false has_user=false
   if [[ -f "${SYSTEM_CONFIG}" ]]; then
     has_system=true
+    local sys_owner=""
+    sys_owner="$(stat -c '%U' "${SYSTEM_CONFIG}" 2>/dev/null || echo "")"
+    if [[ "${sys_owner}" != "${REAL_USER}" ]]; then
+      record_issue "System config owned by ${sys_owner:-unknown} (service runs as ${REAL_USER})"
+    fi
     if config_file_readable "${SYSTEM_CONFIG}"; then
       check_config_file "${SYSTEM_CONFIG}" "System config" || true
     elif config_needs_sudo "${SYSTEM_CONFIG}"; then
-      log_warn "System config exists at ${SYSTEM_CONFIG} (root-owned; run ./doctor.sh with sudo for full check)"
+      log_warn "System config exists at ${SYSTEM_CONFIG} (root-owned; run sudo ./scripts/doctor.sh --fix)"
     else
       check_config_file "${SYSTEM_CONFIG}" "System config" || true
     fi
@@ -442,14 +548,43 @@ run_checks() {
   check_mark "${check_venv}" "Virtualenv at ${VENV_DIR}"
   check_groqtype_import || true
   if [[ "${check_venv}" == "true" ]]; then
-    if check_python_imports >/dev/null 2>&1; then
-      log_ok "Python package imports OK"
+    if run_as_real_user timeout 15 "${VENV_PYTHON}" - <<'PY' >/dev/null 2>&1
+import importlib
+for m in ("evdev", "sounddevice", "soundfile", "numpy"):
+    importlib.import_module(m)
+PY
+    then
+      log_ok "Python core imports OK"
     else
-      record_issue "Python package imports failed"
+      record_issue "Python core imports failed (run: ./scripts/install-deps.sh --python)"
+    fi
+    if run_as_real_user timeout 20 "${VENV_PYTHON}" - <<'PY' >/dev/null 2>&1
+import importlib
+for m in ("torch", "silero_vad"):
+    importlib.import_module(m)
+PY
+    then
+      log_ok "Python ML imports OK"
+    else
+      log_warn "Python ML imports slow or unavailable (optional for daemon hotkey path)"
     fi
   fi
   check_ydotool_socket || true
-  check_audio || true
+  if [[ "${FIX_MODE}" != "true" ]]; then
+    check_audio || true
+  fi
+  if systemctl is-active "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+    log_ok "groqtype system service is active"
+  elif systemctl --user is-active "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+    log_ok "groqtype user service is active"
+  else
+    record_issue "groqtype service is not running"
+  fi
+
+  log_step "Shortcut"
+  check_keyd_shortcut || true
+  check_gnome_shortcut_conflicts || true
+  check_gnome_media_key_blocks || true
 
   log_step "CLI"
   if [[ -x "${REAL_HOME}/.local/bin/groqtype" ]]; then
@@ -459,6 +594,15 @@ run_checks() {
   fi
 }
 
+run_critical_fixes() {
+  ensure_system_config_permissions || true
+  migrate_internal_hotkey || true
+  fix_gnome_shortcut_conflicts || true
+  fix_gnome_media_key_blocks || true
+  fix_keyd_shortcut || true
+  restart_keyd_and_groqtype || true
+}
+
 run_fixes() {
   fix_missing_packages
   fix_venv
@@ -466,9 +610,16 @@ run_fixes() {
   fix_keyd_group
   fix_config "${SYSTEM_CONFIG}" "system config"
   fix_config "${USER_CONFIG}" "user config"
+  ensure_system_config_permissions || true
   fix_ydotool_socket_config
   fix_cli_symlink
+  fix_duplicate_services
+  fix_keyd_shortcut
+  fix_gnome_shortcut_conflicts || true
+  fix_gnome_media_key_blocks || true
+  migrate_internal_hotkey || true
   fix_systemd_service
+  restart_groqtype_service || true
 }
 
 summary() {
@@ -481,7 +632,7 @@ summary() {
   if [[ "${FIXED}" -gt 0 ]]; then
     log_ok "${FIXED} fix(es) applied"
     echo
-    log_info "Re-run ./doctor.sh to verify"
+    log_info "Re-run ./scripts/doctor.sh to verify"
   fi
 }
 
@@ -496,6 +647,8 @@ main() {
       ;;
     --fix)
       FIX_MODE=true
+      detect_real_user
+      run_critical_fixes
       run_checks
       run_fixes
       summary
