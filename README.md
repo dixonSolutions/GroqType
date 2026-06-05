@@ -10,10 +10,13 @@
 
 ---
 
-<video width="100%" controls>
-  <source src="docs/captures/groqtype-demo.webm" type="video/webm">
-  <a href="docs/captures/groqtype-demo.webm">Watch the demo</a>
-</video>
+<p align="center">
+  <img src="docs/captures/groqtype-demo.gif" alt="GroqType demo — hold Caps Lock, speak, text appears in any app" width="800">
+</p>
+
+<p align="center">
+  <a href="docs/captures/groqtype-demo.webm"><strong>▶ Watch full video</strong></a> (WebM)
+</p>
 
 ---
 

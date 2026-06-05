@@ -14,7 +14,8 @@ Layered guides for understanding, configuring, and contributing to GroqType.
 
 | Asset | Description |
 |-------|-------------|
-| [groqtype-demo.webm](captures/groqtype-demo.webm) | Hold-to-talk demo screencast |
+| [groqtype-demo.gif](captures/groqtype-demo.gif) | Hold-to-talk demo (embedded in README) |
+| [groqtype-demo.webm](captures/groqtype-demo.webm) | Full-quality demo screencast |
 
 ## Quick links
 
