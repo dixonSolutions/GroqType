@@ -50,6 +50,7 @@ run_quick_install() {
 
   install_cli_symlink
   install_systemd_service "${mode}"
+  ensure_groqtype_service || log_warn "groqtype service installed but not started (run: sudo ./scripts/doctor.sh --fix)"
   log_ok "Quick install complete. Run ./scripts/doctor.sh to verify."
 }
 
@@ -170,7 +171,7 @@ interactive_install() {
 
   if prompt_yes_no "Install and start systemd service (${mode})?" "y"; then
     install_systemd_service "${mode}"
-    log_ok "Service started"
+    ensure_groqtype_service && log_ok "Service started"
   fi
 
   log_step "Done"

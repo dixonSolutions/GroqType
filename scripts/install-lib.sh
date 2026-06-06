@@ -797,6 +797,65 @@ ensure_user_in_keyd_group() {
   log_warn "Log out and back in for keyd group membership to take effect"
 }
 
+resolve_groqtype_service_mode() {
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  if systemctl is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+    echo "system"
+    return 0
+  fi
+  if systemctl --user is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+    echo "user"
+    return 0
+  fi
+  if [[ -f "${SYSTEMD_UNIT}" ]]; then
+    echo "system"
+    return 0
+  fi
+  if [[ -f "${USER_SYSTEMD_UNIT}" ]]; then
+    echo "user"
+    return 0
+  fi
+  echo ""
+}
+
+ensure_groqtype_service() {
+  [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  local mode
+  mode="$(resolve_groqtype_service_mode)"
+  if [[ -z "${mode}" ]]; then
+    log_warn "No groqtype systemd unit installed; run ./scripts/install.sh first"
+    return 1
+  fi
+
+  if [[ "${mode}" == "system" ]]; then
+    if systemctl is-active "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+      log_ok "groqtype service already active (system)"
+      return 0
+    fi
+    if ! run_sudo true 2>/dev/null; then
+      log_warn "Cannot start groqtype system service without sudo"
+      return 1
+    fi
+    log_info "Starting groqtype system service"
+    run_sudo systemctl enable --now "${SERVICE_NAME}.service"
+    return 0
+  fi
+
+  if systemctl --user is-active "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+    log_ok "groqtype service already active (user)"
+    return 0
+  fi
+  log_info "Starting groqtype user service"
+  if is_root; then
+    run_sudo -u "${REAL_USER}" \
+      env "XDG_RUNTIME_DIR=/run/user/${REAL_UID}" \
+      "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${REAL_UID}/bus" \
+      systemctl --user enable --now "${SERVICE_NAME}.service"
+  else
+    systemctl --user enable --now "${SERVICE_NAME}.service"
+  fi
+}
+
 ensure_ydotool_service() {
   if systemctl is-active ydotool.service >/dev/null 2>&1; then
     log_ok "ydotool service already active"
@@ -1136,20 +1195,31 @@ _groqtype_user_service_installed() {
 
 restart_groqtype_service() {
   [[ -n "${REAL_USER:-}" ]] || detect_real_user
+  local mode
+  mode="$(resolve_groqtype_service_mode)"
 
-  if systemctl is-active "${SERVICE_NAME}.service" >/dev/null 2>&1 \
-    || systemctl is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1; then
-    if run_sudo systemctl restart "${SERVICE_NAME}.service" 2>/dev/null; then
-      log_ok "Restarted ${SERVICE_NAME}.service (system)"
+  if [[ "${mode}" == "system" ]]; then
+    if systemctl is-active "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+      if run_sudo systemctl restart "${SERVICE_NAME}.service" 2>/dev/null; then
+        log_ok "Restarted ${SERVICE_NAME}.service (system)"
+        return 0
+      fi
+    elif run_sudo systemctl start "${SERVICE_NAME}.service" 2>/dev/null; then
+      log_ok "Started ${SERVICE_NAME}.service (system)"
       return 0
     fi
     log_warn "Could not restart system service (run: sudo systemctl restart ${SERVICE_NAME})"
     return 1
   fi
 
-  if _groqtype_user_service_installed; then
-    if _user_systemctl restart 2>/dev/null; then
-      log_ok "Restarted ${SERVICE_NAME}.service (user)"
+  if [[ "${mode}" == "user" ]] || _groqtype_user_service_installed; then
+    if systemctl --user is-active "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+      if _user_systemctl restart 2>/dev/null; then
+        log_ok "Restarted ${SERVICE_NAME}.service (user)"
+        return 0
+      fi
+    elif _user_systemctl start 2>/dev/null; then
+      log_ok "Started ${SERVICE_NAME}.service (user)"
       return 0
     fi
     log_warn "Could not restart user service (run: systemctl --user restart ${SERVICE_NAME})"
