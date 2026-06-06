@@ -371,11 +371,6 @@ check_duplicate_services() {
     record_issue "Both system and user groqtype services are running (causes duplicate hotkey handling)"
     return 1
   fi
-  if [[ "${system_on}" == "true" ]]; then
-    log_ok "groqtype system service is active"
-  elif [[ "${user_on}" == "true" ]]; then
-    log_ok "groqtype user service is active"
-  fi
   return 0
 }
 
@@ -398,9 +393,27 @@ fix_duplicate_services() {
   fi
 }
 
+fix_groqtype_service_running() {
+  local mode
+  mode="$(resolve_groqtype_service_mode)"
+  [[ -n "${mode}" ]] || return 0
+  if [[ "${mode}" == "system" ]]; then
+    systemctl is-active "${SERVICE_NAME}.service" >/dev/null 2>&1 && return 0
+  else
+    systemctl --user is-active "${SERVICE_NAME}.service" >/dev/null 2>&1 && return 0
+  fi
+  log_step "Fix: start groqtype service"
+  if [[ "${FIX_MODE}" == "true" ]] || prompt_yes_no "Start groqtype service (${mode})?" "y"; then
+    ensure_groqtype_service && record_fix "Started groqtype service (${mode})"
+  fi
+}
+
 fix_systemd_service() {
   local mode=""
-  if [[ -f "${SYSTEMD_UNIT}" ]]; then
+  mode="$(resolve_groqtype_service_mode)"
+  if [[ -n "${mode}" ]]; then
+    :
+  elif [[ -f "${SYSTEMD_UNIT}" ]]; then
     mode="system"
   elif [[ -f "${USER_SYSTEMD_UNIT}" ]]; then
     mode="user"
@@ -498,7 +511,10 @@ run_checks() {
   log_step "Services"
   check_service keyd.service system
   check_service ydotool.service system
-  if [[ -f "${SYSTEMD_UNIT}" ]] || [[ -f "${USER_SYSTEMD_UNIT}" ]]; then
+  local groqtype_mode
+  groqtype_mode="$(resolve_groqtype_service_mode)"
+  if [[ -n "${groqtype_mode}" ]]; then
+    check_service "${SERVICE_NAME}.service" "${groqtype_mode}"
     check_duplicate_services || true
     [[ -f "${SYSTEMD_UNIT}" ]] && check_systemd_unit_paths "${SYSTEMD_UNIT}"
     [[ -f "${USER_SYSTEMD_UNIT}" ]] && check_systemd_unit_paths "${USER_SYSTEMD_UNIT}"
@@ -573,13 +589,6 @@ PY
   if [[ "${FIX_MODE}" != "true" ]]; then
     check_audio || true
   fi
-  if systemctl is-active "${SERVICE_NAME}.service" >/dev/null 2>&1; then
-    log_ok "groqtype system service is active"
-  elif systemctl --user is-active "${SERVICE_NAME}.service" >/dev/null 2>&1; then
-    log_ok "groqtype user service is active"
-  else
-    record_issue "groqtype service is not running"
-  fi
 
   log_step "Shortcut"
   check_keyd_shortcut || true
@@ -619,6 +628,7 @@ run_fixes() {
   fix_gnome_media_key_blocks || true
   migrate_internal_hotkey || true
   fix_systemd_service
+  fix_groqtype_service_running
   restart_groqtype_service || true
 }
 
