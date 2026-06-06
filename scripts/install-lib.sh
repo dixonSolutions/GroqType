@@ -856,7 +856,30 @@ ensure_groqtype_service() {
   fi
 }
 
+ydotool_unit_needs_update() {
+  [[ -f /etc/systemd/system/ydotool.service ]] || return 1
+  grep -q "After=multi-user.target" /etc/systemd/system/ydotool.service 2>/dev/null \
+    || grep -q "After=graphical.target" /etc/systemd/system/ydotool.service 2>/dev/null
+}
+
 ensure_ydotool_service() {
+  if ydotool_unit_needs_update; then
+    log_info "Updating ydotool unit to avoid systemd ordering cycle"
+    run_sudo tee /etc/systemd/system/ydotool.service >/dev/null <<'EOF'
+[Unit]
+Description=ydotool system-wide daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ydotoold
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    run_sudo systemctl daemon-reload
+  fi
   if systemctl is-active ydotool.service >/dev/null 2>&1; then
     log_ok "ydotool service already active"
     return 0
@@ -874,7 +897,7 @@ ensure_ydotool_service() {
     run_sudo tee /etc/systemd/system/ydotool.service >/dev/null <<'EOF'
 [Unit]
 Description=ydotool system-wide daemon
-After=multi-user.target
+After=network.target
 
 [Service]
 Type=simple
@@ -936,6 +959,20 @@ systemd_unit_needs_update() {
   if ! grep -qF "Environment=PYTHONPATH=${PROJECT_DIR}" "${unit_file}" 2>/dev/null; then
     return 0
   fi
+  if grep -q "graphical.target" "${unit_file}" 2>/dev/null; then
+    return 0
+  fi
+  if grep -qE "After=.*(ydotool|keyd)\.service" "${unit_file}" 2>/dev/null; then
+    return 0
+  fi
+  if [[ "${mode}" == "system" ]] \
+    && ! grep -qF "user@${REAL_UID}.service" "${unit_file}" 2>/dev/null; then
+    return 0
+  fi
+  if [[ "${mode}" == "system" ]] \
+    && ! grep -q "ydotool_socket" "${unit_file}" 2>/dev/null; then
+    return 0
+  fi
   return 1
 }
 
@@ -989,15 +1026,24 @@ Environment=GROQTYPE_CONFIG=${SYSTEM_CONFIG}
   env_block+="Environment=PATH=${REAL_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
 "
 
+  local unit_after="network.target sound.target"
+  local exec_start_pre=""
+  if [[ "${mode}" == "system" ]]; then
+    unit_after+=" user@${REAL_UID}.service"
+    exec_start_pre="ExecStartPre=/bin/bash -c 'for i in \$(seq 1 90); do if [[ -S /run/user/${REAL_UID}/bus ]] && { [[ -S /run/user/${REAL_UID}/.ydotool_socket ]] || [[ -S /run/.ydotool_socket ]]; } && systemctl is-active ydotool.service >/dev/null 2>&1 && systemctl is-active keyd.service >/dev/null 2>&1; then exit 0; fi; sleep 1; done; echo groqtype: session or dependencies not ready >&2; exit 1'
+"
+  fi
+
   cat <<EOF
 [Unit]
 Description=GroqType speech-to-text daemon
-After=network.target sound.target ydotool.service keyd.service graphical.target
+After=${unit_after}
 Wants=ydotool.service keyd.service
 
 [Service]
 Type=simple
-ExecStart=${exec_start}
+TimeoutStartSec=120
+${exec_start_pre}ExecStart=${exec_start}
 Restart=on-failure
 RestartSec=2
 WorkingDirectory=${work_dir}
