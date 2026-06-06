@@ -130,6 +130,24 @@ check_systemd_unit_paths() {
   if ! grep -q "PYTHONPATH=${PROJECT_DIR}" "${unit_file}" 2>/dev/null; then
     record_issue "Service PYTHONPATH may be stale (expected ${PROJECT_DIR})"
   fi
+  if grep -q "graphical.target" "${unit_file}" 2>/dev/null; then
+    record_issue "Service unit references graphical.target (causes systemd ordering cycle at boot)"
+  fi
+  if grep -E "^After=.*(ydotool|keyd)\.service" "${unit_file}" 2>/dev/null | grep -qv "^#"; then
+    record_issue "Service unit orders after ydotool/keyd with WantedBy=multi-user (causes boot ordering cycle)"
+  fi
+  if [[ -f /etc/systemd/system/ydotool.service ]] \
+    && grep -q "After=multi-user.target" /etc/systemd/system/ydotool.service 2>/dev/null; then
+    record_issue "ydotool.service uses After=multi-user.target (causes groqtype boot ordering cycle)"
+  fi
+}
+
+check_groqtype_boot_cycle() {
+  if journalctl -b --no-pager 2>/dev/null | grep -q "ordering cycle:.*groqtype.service/start"; then
+    record_issue "Boot ordering cycle prevented groqtype from starting (regenerate systemd unit)"
+    return 1
+  fi
+  return 0
 }
 
 check_audio() {
@@ -515,9 +533,16 @@ run_checks() {
   groqtype_mode="$(resolve_groqtype_service_mode)"
   if [[ -n "${groqtype_mode}" ]]; then
     check_service "${SERVICE_NAME}.service" "${groqtype_mode}"
+    check_groqtype_boot_cycle || true
     check_duplicate_services || true
-    [[ -f "${SYSTEMD_UNIT}" ]] && check_systemd_unit_paths "${SYSTEMD_UNIT}"
-    [[ -f "${USER_SYSTEMD_UNIT}" ]] && check_systemd_unit_paths "${USER_SYSTEMD_UNIT}"
+    if [[ "${groqtype_mode}" == "system" ]]; then
+      [[ -f "${SYSTEMD_UNIT}" ]] && check_systemd_unit_paths "${SYSTEMD_UNIT}"
+      if [[ -f "${USER_SYSTEMD_UNIT}" ]] && systemctl --user is-enabled "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+        record_issue "Duplicate user groqtype unit still enabled (use system service only)"
+      fi
+    else
+      [[ -f "${USER_SYSTEMD_UNIT}" ]] && check_systemd_unit_paths "${USER_SYSTEMD_UNIT}"
+    fi
   else
     record_issue "groqtype systemd unit not installed"
   fi

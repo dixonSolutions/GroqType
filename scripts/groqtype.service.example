@@ -4,11 +4,13 @@
 
 [Unit]
 Description=GroqType speech-to-text daemon
-After=network.target sound.target ydotool.service keyd.service graphical.target
+After=network.target sound.target user@1000.service
 Wants=ydotool.service keyd.service
 
 [Service]
 Type=simple
+TimeoutStartSec=120
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 90); do if [[ -S /run/user/1000/bus ]] && { [[ -S /run/user/1000/.ydotool_socket ]] || [[ -S /run/.ydotool_socket ]]; } && systemctl is-active ydotool.service >/dev/null 2>&1 && systemctl is-active keyd.service >/dev/null 2>&1; then exit 0; fi; sleep 1; done; exit 1'
 ExecStart=/path/to/GroqType/.venv/bin/python /path/to/GroqType/groqtype.py daemon
 Restart=on-failure
 RestartSec=2
