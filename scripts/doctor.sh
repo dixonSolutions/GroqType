@@ -485,8 +485,7 @@ fix_keyd_shortcut() {
   shortcut="${_shortcut_cfg[0]:-capslock}"
   hotkey="${_shortcut_cfg[1]:-f18}"
   resolved="$(describe_shortcut_key "${shortcut}")"
-  if [[ "${FIX_MODE}" != "true" ]] \
-    && PYTHONPATH="${PROJECT_DIR}" "${VENV_PYTHON}" - "${shortcut}" "${hotkey}" <<'PY' 2>/dev/null
+  if PYTHONPATH="${PROJECT_DIR}" "${VENV_PYTHON}" - "${shortcut}" "${hotkey}" <<'PY' 2>/dev/null
 import sys
 from keyd_shortcut import current_binding_matches
 shortcut, hotkey = sys.argv[1], sys.argv[2]
