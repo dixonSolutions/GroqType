@@ -130,6 +130,11 @@ check_systemd_unit_paths() {
   if ! grep -q "PYTHONPATH=${PROJECT_DIR}" "${unit_file}" 2>/dev/null; then
     record_issue "Service PYTHONPATH may be stale (expected ${PROJECT_DIR})"
   fi
+  local work_dir
+  work_dir="$(grep '^WorkingDirectory=' "${unit_file}" 2>/dev/null | head -1 | cut -d= -f2-)"
+  if [[ -n "${work_dir}" && "${work_dir}" != "${PROJECT_DIR}" ]]; then
+    record_issue "Service WorkingDirectory is stale (${work_dir}, expected ${PROJECT_DIR})"
+  fi
   if grep -q "graphical.target" "${unit_file}" 2>/dev/null; then
     record_issue "Service unit references graphical.target (causes systemd ordering cycle at boot)"
   fi
@@ -531,7 +536,7 @@ run_checks() {
   local groqtype_mode
   groqtype_mode="$(resolve_groqtype_service_mode)"
   if [[ -n "${groqtype_mode}" ]]; then
-    check_service "${SERVICE_NAME}.service" "${groqtype_mode}"
+    check_service "${SERVICE_NAME}.service" "${groqtype_mode}" || true
     check_groqtype_boot_cycle || true
     check_duplicate_services || true
     if [[ "${groqtype_mode}" == "system" ]]; then
