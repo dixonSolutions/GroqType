@@ -13,6 +13,8 @@ class GroqProvider(BaseProvider):
         fields = {"model": model, "language": language, "response_format": "json", "temperature": "0"}
         body = bytearray()
         for name, value in fields.items():
+            if value in ("", None):
+                continue  # e.g. no language: let Whisper detect it
             body.extend(f"--{boundary}\r\n".encode())
             body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
             body.extend(str(value).encode())

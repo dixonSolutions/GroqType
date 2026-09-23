@@ -408,6 +408,25 @@ def cmd_shortcut(args):
         return
     die("usage: groqtype shortcut set <key> | show | list")
 
+def cmd_transcribe(args):
+    """Print the transcript of an audio file; for other programs (such as
+    the NextKeyBor on-screen keyboard) that record audio themselves."""
+    cfg = load_config()
+    api_key = cfg.get("api_key") or os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        die("no API key (set one with: groqtype config api-key <key>)")
+    if not Path(args.file).is_file():
+        die(f"no such file: {args.file}")
+    language = cfg.get("language", "en") if args.language is None else args.language
+    if language == "auto":
+        language = ""
+    model = cfg.get("batch_model") or cfg.get("model") or "whisper-large-v3-turbo"
+    provider = get_provider(cfg.get("provider", "groq"), api_key)
+    text = provider.transcribe_batch(args.file, model, language)
+    if text.startswith("error:"):
+        die(text[len("error:"):].strip())
+    print(text.strip())
+
 def cmd_config_show(_args):
     cfg = load_config()
     safe = dict(cfg)
@@ -423,6 +442,9 @@ def main():
     c.add_argument("key")
     c.add_argument("value")
     sub.add_parser("config-show")
+    t = sub.add_parser("transcribe", help="Print the transcript of an audio file (WAV)")
+    t.add_argument("file")
+    t.add_argument("--language", help="ISO-639-1 code, or auto (default: the configured language)")
     shortcut = sub.add_parser("shortcut", help="Configure the physical shortcut key (default: capslock)")
     shortcut_sub = shortcut.add_subparsers(dest="action", required=True)
     shortcut_set = shortcut_sub.add_parser("set", help="Set shortcut key and update keyd")
@@ -433,6 +455,7 @@ def main():
     if args.cmd == "daemon": GroqTypeDaemon().run()
     elif args.cmd == "config": cmd_config(args)
     elif args.cmd == "config-show": cmd_config_show(args)
+    elif args.cmd == "transcribe": cmd_transcribe(args)
     elif args.cmd == "shortcut": cmd_shortcut(args)
 
 if __name__ == "__main__":
