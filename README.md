@@ -94,6 +94,7 @@ Deeper dive → [docs/architecture.md](docs/architecture.md)
 Or via CLI:
 
 ```bash
+groqtype transcribe recording.wav --language auto   # print a file's transcript (for other programs)
 groqtype config-show
 groqtype shortcut set capslock
 groqtype config transcribe-mode stream
